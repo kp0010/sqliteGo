@@ -79,7 +79,7 @@ func readRecords(dbFile os.File, cellPointers []uint16) [][]byte {
 
 		var recordSize uint8 = uint8(recordBytes[0])
 
-		recordBytes = make([]byte, recordSize)
+		recordBytes = make([]byte, recordSize+2)
 		_, err = dbFile.ReadAt(recordBytes, int64(pointer))
 		if err != nil {
 			log.Fatal(err)
@@ -91,30 +91,82 @@ func readRecords(dbFile os.File, cellPointers []uint16) [][]byte {
 	return records
 }
 
-func parseRecords(records [][]byte) {
-	for _, record := range records {
-		var rowId int8 = int8(record[1])
+func convSizeToSerialType(contentSize uint16) (serialType uint16) {
+	switch {
+	case (contentSize >= 0 && contentSize <= 4):
+		return uint16(contentSize)
+	case (contentSize == 5):
+		return uint16(6)
+	case (contentSize == 6) || (contentSize == 7):
+		return uint16(8)
+	case (contentSize == 8) || (contentSize == 9):
+		return uint16(1 << (24 - contentSize))
+	case (contentSize >= 12) && (contentSize&1 != 1):
+		return uint16((contentSize - 12) / 2)
+	case (contentSize >= 13) && (contentSize&1 == 1):
+		return uint16((contentSize - 13) / 2)
+	}
+
+	return uint16(0)
+}
+
+func parseRecords(records [][]byte, cellPointers []uint16) []map[string]uint16 {
+	var sqliteSizeMaps []map[string]uint16
+
+	for idx, record := range records {
+		var rowId uint16 = uint16(record[1])
 		var recordHeaderSize int8 = int8(record[2])
-		var sqliteSizeMap = map[string][]byte{
-			"type":       nil,
-			"name":       nil,
-			"table_name": nil,
-			"rootpage":   nil,
-			"sql":        nil,
+
+		var sqliteSizeIndices = []string{"type", "name", "table_name", "rootpage", "sql"}
+
+		var sqliteSizeMap = map[string]uint16{
+			"rowId":            rowId,
+			"cell_pointer":     cellPointers[idx],
+			"recordHeaderSize": uint16(recordHeaderSize),
 		}
 
 		i := 3
-		for key := range sqliteSizeMap {
-			sqliteSizeMap[key] = append(sqliteSizeMap[key], record[i])
+		for _, key := range sqliteSizeIndices {
+			msbRem := int(record[i]) & 0b1111111
+			sqliteSizeMap[key] = sqliteSizeMap[key]*128 + uint16(msbRem)
 			for record[i]&128 != 0 {
 				i++
-				sqliteSizeMap[key] = append(sqliteSizeMap[key], record[i])
+				msbRem := int(record[i]) & 0b1111111
+				sqliteSizeMap[key] = sqliteSizeMap[key]*128 + uint16(msbRem)
 			}
 			i++
+			sqliteSizeMap[key] = convSizeToSerialType(sqliteSizeMap[key])
 		}
 
-		fmt.Println(rowId, recordHeaderSize, sqliteSizeMap)
+		sqliteSizeMaps = append(sqliteSizeMaps, sqliteSizeMap)
 	}
+
+	return sqliteSizeMaps
+}
+
+func parseRecordsSizeMaps(recordSizeMaps []map[string]uint16, records [][]byte) []map[string]string {
+	var sqliteSizeIndices = []string{"type", "name", "table_name", "rootpage", "sql"}
+	recordNames := make([]map[string]string, len(recordSizeMaps))
+	var offset uint16 = 2
+
+	for idx, recordSizeMap := range recordSizeMaps {
+		offset = 2 + recordSizeMap["recordHeaderSize"]
+		recordNames[idx] = make(map[string]string)
+
+		for _, index := range sqliteSizeIndices {
+			var res string
+			if index == "rootpage" {
+				res = fmt.Sprintf("%x", records[idx][offset:offset+recordSizeMap[index]])
+				offset += 1
+			} else {
+				res = string(records[idx][offset : offset+recordSizeMap[index]])
+				offset += recordSizeMap[index]
+			}
+			recordNames[idx][index] = res
+		}
+	}
+
+	return recordNames
 }
 
 // Usage: your_program.sh sample.db .dbinfo | .tables
@@ -131,11 +183,9 @@ func main() {
 
 		pageSize := readPageSize(*dbFile)
 		cellCount := readCellCount(*dbFile, pageSize)
-		cellPointers := readCellPointers(*dbFile, cellCount)
 
 		fmt.Printf("database page size: %v\n", pageSize)
 		fmt.Printf("number of tables: %v\n", cellCount)
-		fmt.Printf("cell pointers: %v\n", cellPointers)
 
 	case ".tables":
 		dbFile, err := os.Open(databaseFilePath)
@@ -146,11 +196,18 @@ func main() {
 		pageSize := readPageSize(*dbFile)
 		cellCount := readCellCount(*dbFile, pageSize)
 		cellPointers := readCellPointers(*dbFile, cellCount)
-		records := readRecords(*dbFile, cellPointers)
-		parseRecords(records)
 
-		// fmt.Printf(string(records[0]))
+		var records [][]byte = readRecords(*dbFile, cellPointers)
+		var recordSizeMaps []map[string]uint16 = parseRecords(records, cellPointers)
 
+		var recordNameMaps []map[string]string = parseRecordsSizeMaps(recordSizeMaps, records)
+
+		for _, mp := range recordNameMaps {
+			fmt.Print(mp["table_name"] + " ")
+			// for key, val := range mp {
+			// 	fmt.Println(key, ":", val)
+			// }
+		}
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
