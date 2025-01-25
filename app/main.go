@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
 )
 
 func parseVarint(inputBytes []byte) (uint64, int) {
@@ -215,16 +213,6 @@ func parseRecords(records [][]byte, varIntSizes []int, cellPointers []uint16) []
 
 		i := varIntSize + 2
 		for _, key := range sqliteSizeIndices {
-			// msbRem := int(record[i]) & 0b1111111
-			// sqliteSizeMap[key] = sqliteSizeMap[key]*128 + uint16(msbRem)
-			// for record[i]&128 != 0 {
-			// 	i++
-			// 	msbRem := int(record[i]) & 0b1111111
-			// 	sqliteSizeMap[key] = sqliteSizeMap[key]*128 + uint16(msbRem)
-			// }
-			// i++
-			// sqliteSizeMap[key] = convSizeToSerialType(sqliteSizeMap[key])
-
 			varint, size := parseVarint(record[i:])
 			i += size
 			sqliteSizeMap[key] = convSizeToSerialType(uint16(varint))
@@ -238,7 +226,9 @@ func parseRecords(records [][]byte, varIntSizes []int, cellPointers []uint16) []
 
 func parseRecordsSizeMaps(records [][]byte, varIntSizes []int, recordSizeMaps []map[string]uint16) []map[string]string {
 	var sqliteSizeIndices = []string{"type", "name", "table_name", "rootpage", "sql"}
+
 	recordNames := make([]map[string]string, len(recordSizeMaps))
+
 	var offset uint16
 
 	for idx, recordSizeMap := range recordSizeMaps {
@@ -263,13 +253,14 @@ func parseRecordsSizeMaps(records [][]byte, varIntSizes []int, recordSizeMaps []
 
 func readPage(dbFile os.File, pageSize uint16, pageIndex uint16) []byte {
 	res := make([]byte, pageSize)
+
 	// fmt.Println(pageSize)
-	//
 	// fmt.Println(int64(pageIndex-1) * int64(pageSize))
 
 	dbFile.ReadAt(res, int64((pageIndex-1)*pageSize))
 
 	// fmt.Println(res, len(res))
+
 	return res
 }
 
@@ -285,7 +276,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		var pageIndex uint16 = 1
+		pageIndex := uint16(1)
 		pageSize := readPageSize(*dbFile)
 
 		var pageHeaders map[string]uint16 = readPageHeader(*dbFile, pageSize, pageIndex)
@@ -300,7 +291,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		var pageIndex uint16 = 1
+		pageIndex := uint16(2)
 		pageSize := readPageSize(*dbFile)
 
 		var pageHeaders map[string]uint16 = readPageHeader(*dbFile, pageSize, pageIndex)
