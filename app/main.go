@@ -6,7 +6,40 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 )
+
+type RecordHeader struct {
+	rowId            uint64
+	cellPointer      uint16
+	recordHeaderSize int8
+	columnSizes      []uint16
+}
+
+func (recHead RecordHeader) String() string {
+	columnSizesStr := strings.Trim(fmt.Sprint(recHead.columnSizes), "[]")
+
+	return fmt.Sprintf(
+		"RecordHeader{rowId: %d, cellPointer: %d, recordHeaderSize: %d, columnSizes: [%s]}",
+		recHead.rowId, recHead.cellPointer, recHead.recordHeaderSize, columnSizesStr,
+	)
+}
+
+type Row struct {
+	rowId            uint64
+	cellPointer      uint16
+	recordHeaderSize int8
+	columns          []interface{}
+}
+
+func (row Row) String() string {
+	values := strings.Trim(fmt.Sprint(row.columns), "[]")
+
+	return fmt.Sprintf(
+		"Row{rowId: %d, cellPointer: %d, recordHeaderSize: %d\ncolumns: [%s]}",
+		row.rowId, row.cellPointer, row.recordHeaderSize, values,
+	)
+}
 
 func parseVarint(inputBytes []byte) (uint64, int) {
 	var res uint64 = 0
@@ -41,32 +74,6 @@ func readPageSize(dbFile os.File) (pageSize uint16) {
 	return
 }
 
-func readCellCount(dbFile os.File, pageSize uint16, pageIndex ...uint16) (cellCount uint16) {
-	// Reading Cells in Page that Indicate Table numbers
-	pageHeader := make([]byte, pageSize)
-
-	var offset uint16 = 100
-	if len(pageIndex) > 0 {
-		offset += (pageIndex[0] - 1) * pageSize
-		if pageIndex[0] != 1 {
-			offset -= 100
-		}
-	}
-
-	// fmt.Println(offset)
-	_, err := dbFile.ReadAt(pageHeader, int64(offset))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if err := binary.Read(bytes.NewReader(pageHeader[3:5]), binary.BigEndian, &cellCount); err != nil {
-		fmt.Println("Failed to read Cell Count", err)
-		return
-	}
-
-	return
-}
-
 func readCellPointers(dbFile os.File, cellCount uint16, pageSize uint16, pageIndex ...uint16) []uint16 {
 	// Reading after Page Header and Finding all Cell offsets
 	cellPointersBytes := make([]byte, cellCount*2)
@@ -79,7 +86,6 @@ func readCellPointers(dbFile os.File, cellCount uint16, pageSize uint16, pageInd
 		}
 	}
 
-	// fmt.Println(offset)
 	_, err := dbFile.ReadAt(cellPointersBytes, int64(offset+8))
 
 	if err != nil {
@@ -108,7 +114,10 @@ func readPageHeader(dbFile os.File, pageSize uint16, pageIndex ...uint16) map[st
 		"page_number",
 	}
 
-	var res = make(map[string]uint16, 6)
+	var res = make(map[string]uint16, 7)
+	res = map[string]uint16{
+		"page_index": pageIndex[0],
+	}
 
 	pageHeaderBytes := make([]byte, 12)
 
@@ -151,12 +160,12 @@ func readRecords(dbFile os.File, cellPointers []uint16, pageSize uint16, pageInd
 	for i, pointer := range cellPointers {
 		recordBytes := make([]byte, 8)
 
-		var offset uint16 = 0
+		var offset int64 = 0
 		if len(pageIndex) > 0 {
-			offset += (pageIndex[0] - 1) * pageSize
+			offset += int64((pageIndex[0] - 1) * pageSize)
 		}
 
-		_, err := dbFile.ReadAt(recordBytes, int64(pointer+offset))
+		_, err := dbFile.ReadAt(recordBytes, int64(pointer)+offset)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -164,7 +173,7 @@ func readRecords(dbFile os.File, cellPointers []uint16, pageSize uint16, pageInd
 		recordSize, size := parseVarint(recordBytes)
 
 		recordBytes = make([]byte, int(recordSize)+1+size)
-		_, err = dbFile.ReadAt(recordBytes, int64(pointer+offset))
+		_, err = dbFile.ReadAt(recordBytes, int64(pointer)+offset)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -176,18 +185,62 @@ func readRecords(dbFile os.File, cellPointers []uint16, pageSize uint16, pageInd
 	return records, varIntSizes
 }
 
+func parseRecordHeader(records [][]byte, varIntSizes []int, cellPointers []uint16) []RecordHeader {
+	// Record Header format
+	// type RecordHeader struct {
+	// 	rowId            uint64
+	// 	cellPointer      uint16
+	// 	recordHeaderSize int8
+	// 	columnSizes      []uint16
+	// }
+
+	recordHeaders := make([]RecordHeader, 0, len(records))
+
+	for idx, record := range records {
+		varIntSize := varIntSizes[idx]
+
+		rowId, rowIdLen := parseVarint(record[varIntSize:])
+
+		var recordHeader = RecordHeader{
+			rowId:            rowId,
+			recordHeaderSize: int8(record[varIntSize+rowIdLen]),
+			cellPointer:      uint16(cellPointers[idx]),
+			columnSizes:      make([]uint16, 0, record[varIntSize+rowIdLen]-1),
+		}
+
+		i := varIntSize + rowIdLen + 1
+
+		for i < int(recordHeader.recordHeaderSize+int8(varIntSize)+1) {
+			varint, size := parseVarint(record[i:])
+			i += size
+			recordHeader.columnSizes = append(recordHeader.columnSizes, uint16(varint))
+		}
+		fmt.Println(recordHeader)
+		fmt.Println("----------------")
+		recordHeaders = append(recordHeaders, recordHeader)
+	}
+
+	return recordHeaders
+}
+
 func convSizeToSerialType(contentSize uint16) (serialType uint16) {
 	switch {
+
 	case (contentSize >= 0 && contentSize <= 4):
 		return uint16(contentSize)
+
 	case (contentSize == 5):
 		return uint16(6)
+
 	case (contentSize == 6) || (contentSize == 7):
 		return uint16(8)
+
 	case (contentSize == 8) || (contentSize == 9):
 		return uint16(1 << (24 - contentSize))
+
 	case (contentSize >= 12) && (contentSize&1 != 1):
 		return uint16((contentSize - 12) / 2)
+
 	case (contentSize >= 13) && (contentSize&1 == 1):
 		return uint16((contentSize - 13) / 2)
 	}
@@ -195,73 +248,145 @@ func convSizeToSerialType(contentSize uint16) (serialType uint16) {
 	return uint16(0)
 }
 
-func parseRecords(records [][]byte, varIntSizes []int, cellPointers []uint16) []map[string]uint16 {
-	var sqliteSizeMaps []map[string]uint16
+func convSerialToValue(serialVal uint16, data []byte) interface{} {
+	reader := bytes.NewReader(data)
 
-	for idx, record := range records {
-		varIntSize := varIntSizes[idx]
-		var rowId uint16 = uint16(record[varIntSize])
-		var recordHeaderSize int8 = int8(record[varIntSize+1])
+	switch serialVal {
 
-		var sqliteSizeIndices = []string{"type", "name", "table_name", "rootpage", "sql"}
+	case 0:
+		return nil
 
-		var sqliteSizeMap = map[string]uint16{
-			"rowId":            rowId,
-			"cell_pointer":     cellPointers[idx],
-			"recordHeaderSize": uint16(recordHeaderSize),
+	case 1:
+		var res int8
+		if err := binary.Read(reader, binary.BigEndian, &res); err != nil {
+			fmt.Println("Failed to Convert to Value", err)
+			return nil
 		}
+		return res
 
-		i := varIntSize + 2
-		for _, key := range sqliteSizeIndices {
-			varint, size := parseVarint(record[i:])
-			i += size
-			sqliteSizeMap[key] = convSizeToSerialType(uint16(varint))
+	case 2:
+		var res int16
+		if err := binary.Read(reader, binary.BigEndian, &res); err != nil {
+			fmt.Println("Failed to Convert to Value", err)
+			return nil
 		}
+		return res
 
-		sqliteSizeMaps = append(sqliteSizeMaps, sqliteSizeMap)
+	case 3:
+		var res int32
+		padding := append(make([]byte, 8), data...)
+		reader := bytes.NewReader(padding)
+		if err := binary.Read(reader, binary.BigEndian, &res); err != nil {
+			fmt.Println("Failed to Convert to Value", err)
+			return nil
+		}
+		return res
+
+	case 4:
+		var res int32
+		if err := binary.Read(reader, binary.BigEndian, &res); err != nil {
+			fmt.Println("Failed to Convert to Value", err)
+			return nil
+		}
+		return res
+
+	case 5:
+		var res int64
+		padding := append(make([]byte, 16), data...)
+		reader := bytes.NewReader(padding)
+		if err := binary.Read(reader, binary.BigEndian, &res); err != nil {
+			fmt.Println("Failed to Convert to Value", err)
+			return nil
+		}
+		return res
+
+	case 6:
+		var res int64
+		if err := binary.Read(reader, binary.BigEndian, &res); err != nil {
+			fmt.Println("Failed to Convert to Value", err)
+			return nil
+		}
+		return res
+
+	case 7:
+		var res float64
+		if err := binary.Read(reader, binary.BigEndian, &res); err != nil {
+			fmt.Println("Failed to Convert to Value", err)
+			return nil
+		}
+		return res
+
+	case 8 | 9:
+		return (map[bool]int{true: 1, false: 0}[serialVal == 9])
+
+	default:
+		return string(data)
+
 	}
-
-	return sqliteSizeMaps
 }
 
-func parseRecordsSizeMaps(records [][]byte, varIntSizes []int, recordSizeMaps []map[string]uint16) []map[string]string {
-	var sqliteSizeIndices = []string{"type", "name", "table_name", "rootpage", "sql"}
+func readRows(records [][]byte, varIntSizes []int, recordHeaders []RecordHeader) []Row {
+	// Row format
+	// type Row struct {
+	// 	rowId            uint64
+	// 	cellPointer      uint16
+	// 	recordHeaderSize int8
+	// 	columns          []interface
+	// }
 
-	recordNames := make([]map[string]string, len(recordSizeMaps))
+	recordRows := make([]Row, len(recordHeaders))
 
 	var offset uint16
 
-	for idx, recordSizeMap := range recordSizeMaps {
-		offset = uint16(varIntSizes[idx]) + recordSizeMap["recordHeaderSize"]
-		recordNames[idx] = make(map[string]string)
+	for idx, recordHeader := range recordHeaders {
+		recordRows[idx] = Row{
+			rowId:            recordHeader.rowId,
+			recordHeaderSize: recordHeader.recordHeaderSize,
+			cellPointer:      recordHeader.cellPointer,
+			columns:          make([]interface{}, len(recordHeader.columnSizes)),
+		}
 
-		for _, index := range sqliteSizeIndices {
-			var res string
-			if index == "rootpage" {
-				res = fmt.Sprintf("%x", records[idx][offset+1:offset+recordSizeMap[index]+1])
-				offset += 1
-			} else {
-				res = string(records[idx][offset+1 : offset+recordSizeMap[index]+1])
-				offset += recordSizeMap[index]
-			}
-			recordNames[idx][index] = res
+		offset = uint16(varIntSizes[idx]) + uint16(recordHeader.recordHeaderSize)
+
+		for col, size := range recordHeader.columnSizes {
+			serialSize := convSizeToSerialType(size)
+			res := convSerialToValue(size, records[idx][offset+1:offset+serialSize+1])
+			offset += serialSize
+
+			recordRows[idx].columns[col] = res
 		}
 	}
 
-	return recordNames
+	return recordRows
 }
 
-func readPage(dbFile os.File, pageSize uint16, pageIndex uint16) []byte {
-	res := make([]byte, pageSize)
+func readPage(dbFile os.File, pageSize uint16, pageIndex uint16) []Row {
 
-	// fmt.Println(pageSize)
-	// fmt.Println(int64(pageIndex-1) * int64(pageSize))
+	var pageHeaders map[string]uint16 = readPageHeader(dbFile, pageSize, pageIndex)
+	var cellCount uint16 = pageHeaders["cell_count"]
 
-	dbFile.ReadAt(res, int64((pageIndex-1)*pageSize))
+	cellPointers := readCellPointers(dbFile, cellCount, pageSize, pageIndex)
 
-	// fmt.Println(res, len(res))
+	var records [][]byte
+	var varIntSizes []int
 
-	return res
+	records, varIntSizes = readRecords(dbFile, cellPointers, pageSize, pageIndex)
+
+	var recordHeaders []RecordHeader = parseRecordHeader(records, varIntSizes, cellPointers)
+
+	for _, mp := range recordHeaders {
+		if 0 == 1 {
+			fmt.Println(mp)
+		}
+	}
+
+	var recordRows []Row = readRows(records, varIntSizes, recordHeaders)
+	//
+	for _, mp := range recordRows {
+		fmt.Println(mp)
+		fmt.Println("----------------")
+	}
+	return recordRows
 }
 
 // Usage: your_program.sh sample.db .dbinfo | .tables
@@ -291,36 +416,16 @@ func main() {
 			log.Fatal(err)
 		}
 
-		pageIndex := uint16(2)
+		pageIndex := uint16(5)
 		pageSize := readPageSize(*dbFile)
 
-		var pageHeaders map[string]uint16 = readPageHeader(*dbFile, pageSize, pageIndex)
-		var cellCount uint16 = pageHeaders["cell_count"]
+		schemaMaps := readPage(*dbFile, pageSize, 1)
+		tableMaps := readPage(*dbFile, pageSize, pageIndex)
 
-		cellPointers := readCellPointers(*dbFile, cellCount, pageSize, pageIndex)
-
-		var records [][]byte
-		var varIntSizes []int
-		records, varIntSizes = readRecords(*dbFile, cellPointers, pageSize, pageIndex)
-		var recordSizeMaps []map[string]uint16 = parseRecords(records, varIntSizes, cellPointers)
-		for _, mp := range recordSizeMaps {
-			for key, val := range mp {
-				fmt.Println(key, ":", val)
-			}
-			fmt.Println("----------------")
+		if 0 == 1 {
+			fmt.Println(schemaMaps, pageIndex, tableMaps)
 		}
 
-		var recordNameMaps []map[string]string = parseRecordsSizeMaps(records, varIntSizes, recordSizeMaps)
-
-		for _, mp := range recordNameMaps {
-			for key, val := range mp {
-				fmt.Println(key, ":", val)
-			}
-			fmt.Println("----------------")
-		}
-
-		// readPage(*dbFile, pageSize, uint16(4))
-		// fmt.Println(readPageHeader(*dbFile, pageSize, pageIndex))
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
