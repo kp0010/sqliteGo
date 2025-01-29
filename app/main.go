@@ -33,12 +33,26 @@ type Row struct {
 }
 
 func (row Row) String() string {
-	values := strings.Trim(fmt.Sprint(row.columns), "[]")
+	// values := strings.Trim(fmt.Sprint(row.columns), "[]")
 
-	return fmt.Sprintf(
-		"Row{rowId: %d, cellPointer: %d, recordHeaderSize: %d\ncolumns: [%s]}",
-		row.rowId, row.cellPointer, row.recordHeaderSize, values,
+	// return fmt.Sprintf(
+	// 	"Row{rowId: %d, cellPointer: %d, recordHeaderSize: %d\ncolumns: [%s]}",
+	// 	row.rowId, row.cellPointer, row.recordHeaderSize, values,
+	// )
+
+	var result string
+
+	result = fmt.Sprintf(
+		"Row >> rowId: %d, cellPointer: %d, recordHeaderSize: %d\n",
+		row.rowId, row.cellPointer, row.recordHeaderSize,
 	)
+
+	var strValues []string
+	for _, v := range row.columns {
+		strValues = append(strValues, fmt.Sprintf("%v", v))
+	}
+
+	return result + strings.Join(strValues, " | ") + "\n"
 }
 
 func parseVarint(inputBytes []byte) (uint64, int) {
@@ -153,12 +167,13 @@ func readPageHeader(dbFile os.File, pageSize uint16, pageIndex ...uint16) map[st
 	return res
 }
 
-func readRecords(dbFile os.File, cellPointers []uint16, pageSize uint16, pageIndex ...uint16) ([][]byte, []int) {
+func readRecords(dbFile os.File, cellPointers []uint16, pageSize uint16, pageIndex ...uint16) ([][]byte, []int, []int) {
 	records := make([][]byte, len(cellPointers))
-	varIntSizes := make([]int, len(cellPointers))
+	recordSizeLens := make([]int, len(cellPointers))
+	rowIdSizeLens := make([]int, len(cellPointers))
 
 	for i, pointer := range cellPointers {
-		recordBytes := make([]byte, 8)
+		recordBytes := make([]byte, 16)
 
 		var offset int64 = 0
 		if len(pageIndex) > 0 {
@@ -170,22 +185,25 @@ func readRecords(dbFile os.File, cellPointers []uint16, pageSize uint16, pageInd
 			log.Fatal(err)
 		}
 
-		recordSize, size := parseVarint(recordBytes)
+		recordSize, recordSizeLen := parseVarint(recordBytes)
+		_, rowIdLen := parseVarint(recordBytes[recordSizeLen:])
 
-		recordBytes = make([]byte, int(recordSize)+1+size)
+		recordBytes = make([]byte, int(recordSize)+recordSizeLen+rowIdLen)
+
 		_, err = dbFile.ReadAt(recordBytes, int64(pointer)+offset)
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		records[i] = recordBytes
-		varIntSizes[i] = size
+		recordSizeLens[i] = recordSizeLen
+		rowIdSizeLens[i] = rowIdLen
 	}
 
-	return records, varIntSizes
+	return records, recordSizeLens, rowIdSizeLens
 }
 
-func parseRecordHeader(records [][]byte, varIntSizes []int, cellPointers []uint16) []RecordHeader {
+func parseRecordHeader(records [][]byte, recordSizeLens []int, rowIdLens []int, cellPointers []uint16) []RecordHeader {
 	// Record Header format
 	// type RecordHeader struct {
 	// 	rowId            uint64
@@ -197,20 +215,21 @@ func parseRecordHeader(records [][]byte, varIntSizes []int, cellPointers []uint1
 	recordHeaders := make([]RecordHeader, 0, len(records))
 
 	for idx, record := range records {
-		varIntSize := varIntSizes[idx]
+		recordSizeLen := recordSizeLens[idx]
+		rowIdLen := rowIdLens[idx]
 
-		rowId, rowIdLen := parseVarint(record[varIntSize:])
+		rowId, _ := parseVarint(record[recordSizeLen:])
 
 		var recordHeader = RecordHeader{
 			rowId:            rowId,
-			recordHeaderSize: int8(record[varIntSize+rowIdLen]),
+			recordHeaderSize: int8(record[recordSizeLen+rowIdLen]),
 			cellPointer:      uint16(cellPointers[idx]),
-			columnSizes:      make([]uint16, 0, record[varIntSize+rowIdLen]-1),
+			columnSizes:      make([]uint16, 0, record[recordSizeLen+rowIdLen]-1),
 		}
 
-		i := varIntSize + rowIdLen + 1
+		i := recordSizeLen + rowIdLen + 1
 
-		for i < int(recordHeader.recordHeaderSize+int8(varIntSize)+1) {
+		for i < int(recordHeader.recordHeaderSize+int8(recordSizeLen)+int8(rowIdLen)) {
 			varint, size := parseVarint(record[i:])
 			i += size
 			recordHeader.columnSizes = append(recordHeader.columnSizes, uint16(varint))
@@ -325,7 +344,7 @@ func convSerialToValue(serialVal uint16, data []byte) interface{} {
 	}
 }
 
-func readRows(records [][]byte, varIntSizes []int, recordHeaders []RecordHeader) []Row {
+func readRows(records [][]byte, recordSizeLens []int, rowIdLens []int, recordHeaders []RecordHeader) []Row {
 	// Row format
 	// type Row struct {
 	// 	rowId            uint64
@@ -346,7 +365,7 @@ func readRows(records [][]byte, varIntSizes []int, recordHeaders []RecordHeader)
 			columns:          make([]interface{}, len(recordHeader.columnSizes)),
 		}
 
-		offset = uint16(varIntSizes[idx]) + uint16(recordHeader.recordHeaderSize)
+		offset = uint16(recordSizeLens[idx]) + uint16(rowIdLens[idx]) + uint16(recordHeader.recordHeaderSize) - 1
 
 		for col, size := range recordHeader.columnSizes {
 			serialSize := convSizeToSerialType(size)
@@ -368,23 +387,25 @@ func readPage(dbFile os.File, pageSize uint16, pageIndex uint16) []Row {
 	cellPointers := readCellPointers(dbFile, cellCount, pageSize, pageIndex)
 
 	var records [][]byte
-	var varIntSizes []int
+	var recordSizeLens []int
+	var rowIdLens []int
 
-	records, varIntSizes = readRecords(dbFile, cellPointers, pageSize, pageIndex)
+	records, recordSizeLens, rowIdLens = readRecords(dbFile, cellPointers, pageSize, pageIndex)
 
-	var recordHeaders []RecordHeader = parseRecordHeader(records, varIntSizes, cellPointers)
+	var recordHeaders []RecordHeader
+	var rowIdLen []int
+	recordHeaders = parseRecordHeader(records, recordSizeLens, rowIdLens, cellPointers)
 
 	for _, mp := range recordHeaders {
 		if 0 == 1 {
-			fmt.Println(mp)
+			fmt.Println(mp, rowIdLen)
 		}
 	}
 
-	var recordRows []Row = readRows(records, varIntSizes, recordHeaders)
+	var recordRows []Row = readRows(records, recordSizeLens, rowIdLens, recordHeaders)
 	//
 	for _, mp := range recordRows {
 		fmt.Println(mp)
-		fmt.Println("----------------")
 	}
 	return recordRows
 }
@@ -416,7 +437,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		pageIndex := uint16(5)
+		pageIndex := uint16(4)
 		pageSize := readPageSize(*dbFile)
 
 		schemaMaps := readPage(*dbFile, pageSize, 1)
@@ -424,6 +445,7 @@ func main() {
 
 		if 0 == 1 {
 			fmt.Println(schemaMaps, pageIndex, tableMaps)
+			fmt.Println(schemaMaps, pageIndex)
 		}
 
 	default:
